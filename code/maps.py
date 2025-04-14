@@ -1,8 +1,9 @@
 import pandas as pd
-import os
 import matplotlib.pyplot as plt
 import numpy as np
-
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
 
 def load_and_validate_data(file_path):
     # load the CSV file into a pandas DataFrame
@@ -65,226 +66,180 @@ def select_team(data, prompt):
             # if the user enters a wrong value, print an error message
             print("Invalid team selection.")
 
-def calculate_match_results(data, selected_team):
-    # filter the DataFrame to get matches where the selected team is in 'Team A' and create a copy
-    team_a_matches = data[data["Team A"] == selected_team].copy()
-    # filter the DataFrame to get matches where the selected team is in 'Team B' and create a copy
-    team_b_matches = data[data["Team B"] == selected_team].copy()
 
-    # apply the combined determine_result function to 'team_a_matches'
-    team_a_matches['Result'] = team_a_matches.apply(lambda row: determine_result(row, selected_team), axis=1)
+def prepare_data_for_regression(data, win_rates_per_map):
+    regression_data = []
+    for index, row in data.iterrows():
+        map_name = row['Map']
+        team_a = row['Team A']
+        team_b = row['Team B']
+        score_a = row['Team A Score']
+        score_b = row['Team B Score']
 
-    # apply the combined determine_result function to 'team_b_matches'
-    team_b_matches['Result'] = team_b_matches.apply(lambda row: determine_result(row, selected_team), axis=1)
+        # get win rates (handle cases where a team might not have played on a map)
+        win_rate_a = win_rates_per_map.get(team_a, {}).get(map_name, 0)
+        win_rate_b = win_rates_per_map.get(team_b, {}).get(map_name, 0)
 
-    return team_a_matches, team_b_matches
+        # create features: win rate difference, average score difference
+        win_rate_diff = win_rate_a - win_rate_b
+        score_diff = score_a - score_b
 
-
-def determine_result(row, selected_team):
-    if row['Team A'] == selected_team:
-        if row['Team A Score'] > row['Team B Score']:
-            return 'Win'
-        elif row['Team A Score'] == row['Team B Score']:
-            return 'Draw'
+        # target variable: 1 if Team A wins, -1 if Team B wins, 0 if draw
+        if score_a > score_b:
+            winner = 1
+        elif score_b > score_a:
+            winner = -1
         else:
-            return 'Loss'
-    elif row['Team B'] == selected_team:
-        if row['Team B Score'] > row['Team A Score']:
-            return 'Win'
-        elif row['Team B Score'] == row['Team A Score']:
-            return 'Draw'
-        else:
-            return 'Loss'
+            winner = 0
 
+        regression_data.append([win_rate_diff, score_diff, winner, map_name, team_a, team_b])
 
-def check_special_cases(team_name, team_matches, opponent_position, data, win_rates_per_map):
-    # initialize an empty list to store the descriptions of special cases
-    special_cases = []
-    # iterate through each match in the provided team's matches
-    for index, row in team_matches.iterrows():
-        # check if the result of the match was a 'Win' for the team
-        if row['Result'] == 'Win':
-            # get the name of the opponent team from the specified column
-            opponent_team = row[opponent_position]
-            # get the name of the map on which the match was played
-            current_map = row['Map']
-            # get the win rate of the current team on the current map from the provided dictionary
-            team_win_rate = win_rates_per_map.get(team_name, {}).get(current_map, 0)
-            # get the win rate of the opponent team on the current map
-            opponent_win_rate = win_rates_per_map.get(opponent_team, {}).get(current_map, 0)
-            # calculate the total number of matches played by the current team on the current map
-            team_matches_count = len(data[(data['Map'] == current_map) &
-                                          ((data['Team A'] == team_name) | (data['Team B'] == team_name))])
-            # calculate the total number of matches played by the opponent team on the current map
-            opponent_matches_count = len(data[(data['Map'] == current_map) &
-                                              ((data['Team A'] == opponent_team) | (data['Team B'] == opponent_team))])
-            # check if both teams have played at least one match on the current map
-            # and if the opponent's win rate is strictly greater than the current team's win rate
-            if (team_matches_count > 0 and opponent_matches_count > 0 and
-                    opponent_win_rate > team_win_rate):
-                # if the conditions are met, add a description of the special case to the list
-                special_cases.append(
-                    f"{team_name} beat {opponent_team} on {current_map} "
-                    f"(Opponent's win rate: {opponent_win_rate:.2f} > {team_name}'s win rate: {team_win_rate:.2f})"
-                )
+    regression_df = pd.DataFrame(regression_data, columns=['win_rate_difference', 'score_difference', 'winner', 'map', 'team_a', 'team_b'])
+    return regression_df
 
-    # return the list of special case descriptions
-    return special_cases
+def train_linear_regression_model(df):
+    # select features and target
+    features = ['win_rate_difference', 'score_difference']
+    target = 'winner'
 
+    # handle potential NaN values (e.g., if a team has no prior games)
+    df_cleaned = df.dropna(subset=features + [target])
 
-def has_special_case(team_name, map_name, data, win_rates_per_map):
-    # filter the data to only include matches played on the specified map
-    filtered_data = data[data['Map'] == map_name]
-    # calculate the match results for the given team on the filtered data
-    team_a_matches, team_b_matches = calculate_match_results(filtered_data, team_name)
+    if df_cleaned.empty:
+        print("Warning: No valid data for linear regression after handling missing values.")
+        return None
 
-    # initialize an empty list to store special cases
-    special_cases = []
-    # check for special cases where the team was 'Team A'
-    special_cases.extend(check_special_cases(team_name, team_a_matches, 'Team B', data, win_rates_per_map))
-    # check for special cases where the team was 'Team B'
-    special_cases.extend(check_special_cases(team_name, team_b_matches, 'Team A', data, win_rates_per_map))
+    X = df_cleaned[features]
+    y = df_cleaned[target]
 
-    # return True if the list of special cases is not empty, indicating at least one special case exists
-    return len(special_cases) > 0
+    # split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+    # initialize and train the linear regression model
+    model = LinearRegression()
+    model.fit(X_train, y_train)
 
-def plot_team_comparison(team1, team2, all_maps, win_rates_per_map, special_cases_team1, special_cases_team2):
-    # create a new figure and a set of subplots
-    plt.figure(figsize=(14, 10))
+    # make predictions on the test set
+    y_pred = model.predict(X_test)
 
-    # get the total number of maps
-    n_maps = len(all_maps)
-    # create an array of indices for the x-axis positions of the bars
+    # evaluate the model
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"\n--- Linear Regression Model ---")
+    print(f"Mean Squared Error on Test Set: {mse:.2f}")
+
+    # return the trained model and the test data
+    return model, X_test, y_test
+
+def predict_with_linear_regression(model, win_rate_diff, score_diff):
+    if model is None:
+        print("Error: Linear regression model not trained.")
+        return None
+
+    # prepare the input data as a DataFrame
+    input_data = pd.DataFrame({'win_rate_difference': [win_rate_diff], 'score_difference': [score_diff]})
+
+    # make the prediction
+    prediction = model.predict(input_data)[0]
+    return prediction
+
+def visualize_regression_comparison(team_a, team_b, map_names, win_rate_diffs, predictions):
+    n_maps = len(map_names)
     index = np.arange(n_maps)
-    # define the width of the bars
     bar_width = 0.35
 
-    # create the bar plot for the win rates of the first team
-    team1_bars = plt.bar(index,
-                         [win_rates_per_map.get(team1, {}).get(map_name, 0) for map_name in all_maps],
-                         bar_width,
-                         label=f'{team1} Win Rate',
-                         color='skyblue')
+    fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    # create the bar plot for the win rates of the second team, offset by the bar width
-    team2_bars = plt.bar(index + bar_width,
-                         [win_rates_per_map.get(team2, {}).get(map_name, 0) for map_name in all_maps],
-                         bar_width,
-                         label=f'{team2} Win Rate',
-                         color='lightcoral')
+    color = 'tab:blue'
+    ax1.set_xlabel('Map')
+    ax1.set_ylabel('Win Rate Difference (Team A - Team B)', color=color)
+    rects1 = ax1.bar(index, win_rate_diffs, bar_width, label='Win Rate Difference', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_xticks(index)
+    ax1.set_xticklabels(map_names, rotation=45, ha='right')
+    ax1.tick_params(axis='x', rotation=45, labelsize=8)
 
-    # add visual indicators for special cases by adding a small bar on top of the existing win rate bar
-    for i, map_name in enumerate(all_maps):
-        # if team1 has a special case on the current map, add a blue bar on top
-        if special_cases_team1.get(map_name, False):
-            plt.bar(i, 0.1, bar_width, bottom=win_rates_per_map.get(team1, {}).get(map_name, 0),
-                    color='blue', alpha=0.7, label='_nolegend_')
+    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
 
-        # if team2 has a special case on the current map, add a red bar on top
-        if special_cases_team2.get(map_name, False):
-            plt.bar(i + bar_width, 0.1, bar_width, bottom=win_rates_per_map.get(team2, {}).get(map_name, 0),
-                    color='red', alpha=0.7, label='_nolegend_')
+    color = 'tab:red'
+    ax2.set_ylabel('Linear Regression Prediction Value', color=color)  # we already handled the x-label with ax1
+    line2 = ax2.plot(index + bar_width / 2, predictions, marker='o', linestyle='-', color=color, label='LR Prediction')
+    ax2.tick_params(axis='y', labelcolor=color)
 
-    # set the labels for the x and y axes
-    plt.xlabel('Maps')
-    plt.ylabel('Win Rate')
-    # set the title of the plot
-    plt.title(f'Win Rates Comparison: {team1} vs {team2}')
-    # set the x-axis tick positions and labels, rotating the labels for better readability
-    plt.xticks(index + bar_width / 2, all_maps, rotation=45, ha='right')
-    # set the y-axis limits to ensure the special case indicators are visible
-    plt.ylim(0, 1.2)
+    # add legend
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc='upper right')
 
-    # create custom legend elements to explain the different parts of the plot
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor='skyblue', edgecolor='black', label=f'{team1} Base Win Rate'),
-        Patch(facecolor='blue', alpha=0.7, edgecolor='black', label=f'{team1} Special Case Boost'),
-        Patch(facecolor='lightcoral', edgecolor='black', label=f'{team2} Base Win Rate'),
-        Patch(facecolor='red', alpha=0.7, edgecolor='black', label=f'{team2} Special Case Boost'),
-    ]
-    # add the legend to the plot
-    plt.legend(handles=legend_elements, loc='upper right')
-
-    # adjust the plot layout to prevent labels from being cut off
-    plt.tight_layout()
-    # add a grid to the y-axis for easier comparison of win rates
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-    # save the generated plot as a PNG file
-    plt.savefig('team_comparison.png')
-    print("\nComparison plot saved as 'team_comparison.png'")
-    # close the plot to free up memory
+    fig.tight_layout()  # otherwise the right y-label might be slightly clipped
+    plt.title(f'Win Rate Difference and Linear Regression Prediction: {team_a} vs {team_b}')
+    plt.savefig(f'regression_comparison_{team_a}_vs_{team_b}.png')
+    print(f"\nRegression comparison chart saved as 'regression_comparison_{team_a}_vs_{team_b}.png'")
     plt.close()
 
 
-def compare_team_winrates_per_map(file_path):
-    # load and validate the data from the specified file path
+def interpret_prediction_value(prediction_value):
+    if prediction_value > 0.2:
+        return "Team A is likely to win"
+    elif prediction_value < -0.2:
+        return "Team B is likely to win"
+    else:
+        return "It's a close match"
+
+
+if __name__ == "__main__":
+    file_path = 'maps_scores.csv'  # specify your CSV file path
+
+    # run the team win rate comparison and plotting
+    load_and_validate_data(file_path)
+
+    # prepare data for linear regression
     data = load_and_validate_data(file_path)
-    # calculate the win rates for each team on each map
     win_rates_per_map = calculate_win_rates_per_map(data)
+    all_teams = sorted(set(data["Team A"].tolist() + data["Team B"].tolist()))
 
-    # select the first team for comparison
-    team1 = select_team(data, "Team 1")
-    # select the second team for comparison
-    team2 = select_team(data, "Team 2")
+    if len(all_teams) >= 2:
+        print("\n--- Linear Regression Analysis ---")
 
-    # get a sorted list of all unique map names from the data
-    all_maps = sorted(data["Map"].unique())
-    # print a message indicating which teams are being compared
-    print(f"\nComparing {team1} and {team2} across all maps:")
+        # let the user select two teams for linear regression-based prediction
+        team_a_predict = select_team(data, "Team A for linear regression prediction")
+        team_b_predict = select_team(data, "Team B for linear regression prediction")
 
-    # initialize dictionaries to store predictions and special case information for each team and map
-    predictions = {}
-    special_cases_team1 = {}
-    special_cases_team2 = {}
+        # get win rates for the selected teams across all maps
+        unique_maps = sorted(data['Map'].unique())
+        win_rate_team_a_predict = {map_name: win_rates_per_map.get(team_a_predict, {}).get(map_name, 0) for map_name in unique_maps}
+        win_rate_team_b_predict = {map_name: win_rates_per_map.get(team_b_predict, {}).get(map_name, 0) for map_name in unique_maps}
 
-    # iterate through each map to compare the teams' win rates and check for special cases
-    for map_name in all_maps:
-        # get the win rate of the first team on the current map
-        win_rate_team1 = win_rates_per_map.get(team1, {}).get(map_name, 0)
-        # get the win rate of the second team on the current map
-        win_rate_team2 = win_rates_per_map.get(team2, {}).get(map_name, 0)
+        # prepare regression data (using all matches for training)
+        regression_df = prepare_data_for_regression(data, win_rates_per_map)
 
-        # check if the first team has a special case (beat a higher-ranked opponent) on the current map
-        has_special_case_team1 = has_special_case(team1, map_name, data, win_rates_per_map)
-        # check if the second team has a special case on the current map
-        has_special_case_team2 = has_special_case(team2, map_name, data, win_rates_per_map)
+        # train the linear regression model
+        linear_regression_model, _, _ = train_linear_regression_model(regression_df)
 
-        # store whether each team has a special case on the current map
-        special_cases_team1[map_name] = has_special_case_team1
-        special_cases_team2[map_name] = has_special_case_team2
+        if linear_regression_model is not None:
+            print(f"\n--- Linear Regression Prediction: {team_a_predict} vs {team_b_predict} ---")
+            map_names_for_plot = []
+            win_rate_diffs_for_plot = []
+            predictions_for_plot = []
 
-        # adjust the win rates by adding a 10% boost if the team has a special case on the map
-        adjusted_win_rate_team1 = win_rate_team1 + (0.1 if has_special_case_team1 else 0)
-        adjusted_win_rate_team2 = win_rate_team2 + (0.1 if has_special_case_team2 else 0)
+            for map_name in unique_maps:
+                wr_a = win_rate_team_a_predict.get(map_name, 0)
+                wr_b = win_rate_team_b_predict.get(map_name, 0)
+                wr_diff = wr_a - wr_b
+                # for prediction, we don't have the future score difference, so we use 0
+                prediction_value = predict_with_linear_regression(linear_regression_model, wr_diff, 0)
+                prediction_label = interpret_prediction_value(prediction_value)
 
-        # print the win rates for both teams on the current map, indicating if a special case applies
-        print(f"\n--- Map: {map_name} ---")
-        print(
-            f"{team1} Win Rate: {win_rate_team1:.2f}{' (+10% due to special case)' if has_special_case_team1 else ''}")
-        print(
-            f"{team2} Win Rate: {win_rate_team2:.2f}{' (+10% due to special case)' if has_special_case_team2 else ''}")
+                map_names_for_plot.append(map_name)
+                win_rate_diffs_for_plot.append(wr_diff)
+                predictions_for_plot.append(prediction_value)
 
-        # predict the winner on the current map based on the adjusted win rates
-        if adjusted_win_rate_team1 > adjusted_win_rate_team2:
-            predictions[map_name] = team1
-            print(f"Prediction: {team1} is likely to win on {map_name}.")
-        elif adjusted_win_rate_team2 > adjusted_win_rate_team1:
-            predictions[map_name] = team2
-            print(f"Prediction: {team2} is likely to win on {map_name}.")
+                print(f"On map '{map_name}': Win Rate Diff ({team_a_predict} - {team_b_predict}) = {wr_diff:.2f}, Linear Regression Prediction Value = {prediction_value:.2f} ({prediction_label})")
+
+            # generate comparison chart
+            visualize_regression_comparison(team_a_predict, team_b_predict, map_names_for_plot, win_rate_diffs_for_plot, predictions_for_plot)
+
         else:
-            predictions[map_name] = "Draw (or very close)"
-            print(f"Prediction: It's a close call between {team1} and {team2} on {map_name}.")
+            print("Linear regression model could not be trained.")
 
-    # print an overall summary of the map predictions
-    print("\n--- Overall Map Predictions ---")
-    for map_name, predicted_winner in predictions.items():
-        print(f"On {map_name}: {predicted_winner}")
-
-    # generate a visual comparison of the two teams' win rates across all maps
-    plot_team_comparison(team1, team2, all_maps, win_rates_per_map, special_cases_team1, special_cases_team2)
-
-
-compare_team_winrates_per_map('maps_scores.csv')
+    else:
+        print("\nNot enough teams in the data to perform linear regression comparison.")
